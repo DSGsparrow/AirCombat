@@ -25,7 +25,7 @@ def parse_args():
 
     # 基本路径
     parser.add_argument("--log_file", type=str, default="./train/result/train_shoot_static_solo_gap.log")
-    parser.add_argument("--model_path", type=str, default="trained_model/shoot_static_solo4/final_model.zip")
+    parser.add_argument("--model_path", type=str, default="")
     parser.add_argument("--pretrained_pt_path", type=str, default="")
     parser.add_argument("--checkpoint_path", type=str, default="./trained_model/shoot_static_solo_gap/checkpoints/")
     parser.add_argument("--tb_log", type=str, default="./ppo_air_combat_sp_tb/")
@@ -69,23 +69,35 @@ def parse_args():
     return parser.parse_args()
 
 
+
 class HybridActionWrapper(gym.Wrapper):
     """
     只训练“发射布尔值”，前三维机动动作恒为 0。
-    若 action=1 且底层返回 info['launch']=True：
-      - rollout_after_launch=True: 在内部 roll out 到回合结束，累计奖励一次性返回
-      - rollout_after_launch=False: 不跳过，按普通一步返回
+    新增功能：决策间隔（action repeat / frame skip）
+      - 外部智能体每次决策后，环境内部自动执行 decision_interval 步
+      - 本 wrapper 会累计这几步的 reward 并返回最后一步的 obs / done / info
+
+    参数
+    ----
+    decision_interval : int >= 1
+        间隔步数（例如 5 表示每次决策后自动走 5 步）
+    edge_fire : bool
+        True  ：仅在间隔内的第一步将 fire=1 传入底层，其余步强制 fire=0（避免多次发射）
+        False ：在整个间隔内重复相同的 fire 值（可能导致多次发射）
     """
 
-    def __init__(self, env, rollout_after_launch: bool = True):
+    def __init__(self, env, decision_interval: int = 1, edge_fire: bool = True):
         super().__init__(env)
-        self.rollout_after_launch = rollout_after_launch
+        assert isinstance(decision_interval, int) and decision_interval >= 1, \
+            f"decision_interval 必须是 >=1 的整数，给定 {decision_interval}"
+        self.decision_interval = decision_interval
+        self.edge_fire = bool(edge_fire)
 
         # 对外：观测不变，只训练二元发射
         self.observation_space = env.observation_space
         self.action_space = spaces.Discrete(2)  # 0=不发射, 1=发射
 
-        # 底层动作空间信息
+        # 底层动作空间信息（≥4维：前三维机动，最后一维 fire）
         self._is_multidiscrete = isinstance(env.action_space, spaces.MultiDiscrete)
         self._is_box = isinstance(env.action_space, spaces.Box)
 
@@ -101,8 +113,18 @@ class HybridActionWrapper(gym.Wrapper):
         self._last_obs = None
 
     # 运行时动态切换
-    def set_rollout_after_launch(self, flag: bool):
-        self.rollout_after_launch = bool(flag)
+    def set_decision_interval(self, n: int):
+        assert isinstance(n, int) and n >= 1, f"decision_interval 必须 >=1，给定 {n}"
+        self.decision_interval = n
+
+    def set_edge_fire(self, flag: bool):
+        self.edge_fire = bool(flag)
+
+    # ---------- 兼容 gym / gymnasium ----------
+    @staticmethod
+    def _is_gymnasium_step_tuple(t):
+        # gymnasium: (obs, reward, terminated, truncated, info)
+        return isinstance(t, tuple) and len(t) == 5
 
     # ---------- 构造底层动作（前三维 0，最后一维为 fire） ----------
     def _build_action(self, fire_bool: int):
@@ -126,100 +148,227 @@ class HybridActionWrapper(gym.Wrapper):
         else:
             raise RuntimeError("未知的动作空间类型。")
 
-    # ---------- 兼容 gym / gymnasium ----------
-    @staticmethod
-    def _is_gymnasium_step_tuple(t):
-        # gymnasium: (obs, reward, terminated, truncated, info)
-        return isinstance(t, tuple) and len(t) == 5
-
     def reset(self, **kwargs):
         ret = self.env.reset(**kwargs)
-        if isinstance(ret, tuple) and len(ret) == 2:
+        if isinstance(ret, tuple) and len(ret) == 2:  # gymnasium
             obs, info = ret
             self._last_obs = obs
             return obs, info
-        else:
+        else:  # gym
             self._last_obs = ret
             return ret
 
     def step(self, action):
-        # 上层只传 0/1
+        # 解析外部二元动作
         if isinstance(action, (np.ndarray, list, tuple)):
             fire_bool = int(np.asarray(action).reshape(-1)[0])
         else:
             fire_bool = int(action)
 
-        # 第一步：按上层选择是否发射
-        full_action = self._build_action(fire_bool)
-        step_out = self.env.step(full_action)
+        total_reward = 0.0
+        any_launch = False
+        last_info = {}
+        terminated = False
+        truncated = False
+        done = False
+        obs = self._last_obs
 
-        if self._is_gymnasium_step_tuple(step_out):
-            obs, reward, terminated, truncated, info = step_out
-            self._last_obs = obs
-            launched = bool(info.get("launch", False))
-            done = terminated or truncated
-        else:
-            obs, reward, done, info = step_out
-            self._last_obs = obs
-            launched = bool(info.get("launch", False))
-            terminated, truncated = done, False  # 统一用
+        # 在间隔内执行多步
+        for k in range(self.decision_interval):
+            # edge_fire=True 时，仅第一步传 fire_bool，其余步强制 0
+            this_fire = fire_bool if (k == 0 or not self.edge_fire) else 0
 
-        # 未发射：直接返回本步
-        if not launched:
-            return (obs, reward, terminated, truncated, info) if self._is_gymnasium_step_tuple(step_out) \
-                   else (obs, reward, done, info)
-
-        # 发射了，但选择“不跳过”：返回本步（保持与底层一致）
-        if not self.rollout_after_launch:
-            return (obs, reward, terminated, truncated, info) if self._is_gymnasium_step_tuple(step_out) \
-                   else (obs, reward, done, info)
-
-        # 发射且“跳过后续”：内部 roll out 到回合结束并累加奖励
-        cum_reward = float(reward)
-        rolled_steps = 0
-
-        while True:
-            if self._is_gymnasium_step_tuple(step_out):
-                if terminated or truncated:
-                    break
-            else:
-                if done:
-                    break
-
-            # 后续固定 fire=0，前三维仍为 0
-            full_action = self._build_action(0)
+            full_action = self._build_action(this_fire)
             step_out = self.env.step(full_action)
 
             if self._is_gymnasium_step_tuple(step_out):
                 obs, r, terminated, truncated, info = step_out
-                self._last_obs = obs
-                cum_reward += float(r)
-                rolled_steps += 1
+                done = terminated or truncated
             else:
                 obs, r, done, info = step_out
-                self._last_obs = obs
-                cum_reward += float(r)
-                rolled_steps += 1
-                terminated, truncated = done, False  # 仅为统一标记
+                # 为统一，下两行提供占位
+                terminated, truncated = done, False
 
-        # 在最后一步的 info 里补充一些记录（只在“跳过”模式下添加）
-        info = dict(info) if isinstance(info, dict) else {}
-        info.setdefault("launched", True)
-        info["rolled_out_steps"] = rolled_steps
-        info["cum_reward_after_launch"] = cum_reward
+            self._last_obs = obs
+            total_reward += float(r)
+            last_info = info if isinstance(info, dict) else {}
+            any_launch = any_launch or bool(last_info.get("launch", False))
 
-        # 返回“终止时刻”的 obs / flags，以及累计奖励
-        if self._is_gymnasium_step_tuple(step_out):
-            return obs, cum_reward, terminated, truncated, info
+            if done:  # 若提前结束，跳出
+                break
+
+        # 补充一些统计信息（可选）
+        if isinstance(last_info, dict):
+            last_info = dict(last_info)
+            last_info["decision_interval"] = self.decision_interval
+            last_info["interval_steps_executed"] = k + 1  # 实际执行了几步
+            last_info["interval_reward_sum"] = total_reward
+            last_info["interval_any_launch"] = any_launch
         else:
-            return obs, cum_reward, True, info
+            last_info = {
+                "decision_interval": self.decision_interval,
+                "interval_steps_executed": k + 1,
+                "interval_reward_sum": total_reward,
+                "interval_any_launch": any_launch,
+            }
+
+        # 返回最后一步的 obs / flags，以及累计奖励
+        if self._is_gymnasium_step_tuple(step_out):
+            return obs, total_reward, terminated, truncated, last_info
+        else:
+            return obs, total_reward, done, last_info
+# class HybridActionWrapper(gym.Wrapper):
+#     """
+#     只训练“发射布尔值”，前三维机动动作恒为 0。
+#     若 action=1 且底层返回 info['launch']=True：
+#       - rollout_after_launch=True: 在内部 roll out 到回合结束，累计奖励一次性返回
+#       - rollout_after_launch=False: 不跳过，按普通一步返回
+#     """
+#
+#     def __init__(self, env, rollout_after_launch: bool = True):
+#         super().__init__(env)
+#         self.rollout_after_launch = rollout_after_launch
+#
+#         # 对外：观测不变，只训练二元发射
+#         self.observation_space = env.observation_space
+#         self.action_space = spaces.Discrete(2)  # 0=不发射, 1=发射
+#
+#         # 底层动作空间信息
+#         self._is_multidiscrete = isinstance(env.action_space, spaces.MultiDiscrete)
+#         self._is_box = isinstance(env.action_space, spaces.Box)
+#
+#         if self._is_multidiscrete:
+#             nvec = env.action_space.nvec
+#             assert len(nvec) >= 4, f"期望底层动作≥4维，现在是 {len(nvec)}"
+#         elif self._is_box:
+#             assert env.action_space.shape[0] >= 4, \
+#                 f"期望底层连续动作≥4维，现在是 {env.action_space.shape}"
+#         else:
+#             raise TypeError("底层动作空间既不是 MultiDiscrete 也不是 Box。")
+#
+#         self._last_obs = None
+#
+#     # 运行时动态切换
+#     def set_rollout_after_launch(self, flag: bool):
+#         self.rollout_after_launch = bool(flag)
+#
+#     # ---------- 构造底层动作（前三维 0，最后一维为 fire） ----------
+#     def _build_action(self, fire_bool: int):
+#         fire = int(fire_bool)
+#
+#         if self._is_multidiscrete:
+#             out = np.zeros_like(self.env.action_space.nvec, dtype=np.int64)
+#             out[:3] = 0
+#             out[3] = fire
+#             # 合法范围
+#             out = np.minimum(out, self.env.action_space.nvec - 1)
+#             out = np.maximum(out, 0)
+#             return out
+#
+#         elif self._is_box:
+#             out = np.zeros((self.env.action_space.shape[0],), dtype=np.float32)
+#             out[:3] = 0.0
+#             out[3] = float(fire)
+#             return np.clip(out, self.env.action_space.low, self.env.action_space.high)
+#
+#         else:
+#             raise RuntimeError("未知的动作空间类型。")
+#
+#     # ---------- 兼容 gym / gymnasium ----------
+#     @staticmethod
+#     def _is_gymnasium_step_tuple(t):
+#         # gymnasium: (obs, reward, terminated, truncated, info)
+#         return isinstance(t, tuple) and len(t) == 5
+#
+#     def reset(self, **kwargs):
+#         ret = self.env.reset(**kwargs)
+#         if isinstance(ret, tuple) and len(ret) == 2:
+#             obs, info = ret
+#             self._last_obs = obs
+#             return obs, info
+#         else:
+#             self._last_obs = ret
+#             return ret
+#
+#     def step(self, action):
+#         # 上层只传 0/1
+#         if isinstance(action, (np.ndarray, list, tuple)):
+#             fire_bool = int(np.asarray(action).reshape(-1)[0])
+#         else:
+#             fire_bool = int(action)
+#
+#         # 第一步：按上层选择是否发射
+#         full_action = self._build_action(fire_bool)
+#         step_out = self.env.step(full_action)
+#
+#         if self._is_gymnasium_step_tuple(step_out):
+#             obs, reward, terminated, truncated, info = step_out
+#             self._last_obs = obs
+#             launched = bool(info.get("launch", False))
+#             done = terminated or truncated
+#         else:
+#             obs, reward, done, info = step_out
+#             self._last_obs = obs
+#             launched = bool(info.get("launch", False))
+#             terminated, truncated = done, False  # 统一用
+#
+#         # 未发射：直接返回本步
+#         if not launched:
+#             return (obs, reward, terminated, truncated, info) if self._is_gymnasium_step_tuple(step_out) \
+#                    else (obs, reward, done, info)
+#
+#         # 发射了，但选择“不跳过”：返回本步（保持与底层一致）
+#         if not self.rollout_after_launch:
+#             return (obs, reward, terminated, truncated, info) if self._is_gymnasium_step_tuple(step_out) \
+#                    else (obs, reward, done, info)
+#
+#         # 发射且“跳过后续”：内部 roll out 到回合结束并累加奖励
+#         cum_reward = float(reward)
+#         rolled_steps = 0
+#
+#         while True:
+#             if self._is_gymnasium_step_tuple(step_out):
+#                 if terminated or truncated:
+#                     break
+#             else:
+#                 if done:
+#                     break
+#
+#             # 后续固定 fire=0，前三维仍为 0
+#             full_action = self._build_action(0)
+#             step_out = self.env.step(full_action)
+#
+#             if self._is_gymnasium_step_tuple(step_out):
+#                 obs, r, terminated, truncated, info = step_out
+#                 self._last_obs = obs
+#                 cum_reward += float(r)
+#                 rolled_steps += 1
+#             else:
+#                 obs, r, done, info = step_out
+#                 self._last_obs = obs
+#                 cum_reward += float(r)
+#                 rolled_steps += 1
+#                 terminated, truncated = done, False  # 仅为统一标记
+#
+#         # 在最后一步的 info 里补充一些记录（只在“跳过”模式下添加）
+#         info = dict(info) if isinstance(info, dict) else {}
+#         info.setdefault("launched", True)
+#         info["rolled_out_steps"] = rolled_steps
+#         info["cum_reward_after_launch"] = cum_reward
+#
+#         # 返回“终止时刻”的 obs / flags，以及累计奖励
+#         if self._is_gymnasium_step_tuple(step_out):
+#             return obs, cum_reward, terminated, truncated, info
+#         else:
+#             return obs, cum_reward, True, info
+
 
 
 
 def make_wrapped_env(env_id, args):
     """工厂函数：创建单个底层 env 并包上 HybridActionWrapper。"""
     base = make_normal_env(env_id, args)  # 你原来的环境创建
-    wrapped = HybridActionWrapper(base, rollout_after_launch=False)
+    wrapped = HybridActionWrapper(base, decision_interval=5, edge_fire=True)
     return wrapped
 
 
